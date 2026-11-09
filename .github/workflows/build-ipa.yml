@@ -81,7 +81,7 @@ jobs:
             --entitlements upstream/GestaltX/GestaltX.entitlements \
             --generate-entitlement-der "$app"
           codesign --verify --strict --verbose=2 "$app"
-          codesign -d --entitlements - "$app" > "$RUNNER_TEMP/gestaltx-entitlements.plist"
+          codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/gestaltx-entitlements.plist"
           python3 - <<'PY'
           import os, pathlib, plistlib, subprocess
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
