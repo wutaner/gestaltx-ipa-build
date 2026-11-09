@@ -1,0 +1,138 @@
+name: Build GestaltX IPA
+
+on:
+  push:
+    paths:
+      - .github/workflows/build-ipa.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      UPSTREAM_COMMIT: 4b3b25fd1dae16154858b834c6dc7bca666016e2
+      IPA_NAME: GestaltX_1.0.2-source-4b3b25f-AppGroup.ipa
+    steps:
+      - name: Check out pinned upstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: huamidev/GestaltX
+          ref: 4b3b25fd1dae16154858b834c6dc7bca666016e2
+          path: upstream
+          persist-credentials: false
+
+      - name: Verify source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          git -C upstream status --porcelain
+
+      - name: Run existing document and cache layout tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun swiftc -parse-as-library \
+            upstream/GestaltX/GestaltDocument.swift \
+            upstream/GestaltX/Capabilities.swift \
+            upstream/GestaltX/MobileGestaltCacheLayout.swift \
+            upstream/GestaltX/FaceTimeAudioCache.swift \
+            upstream/tests/DocumentTests.swift \
+            -o "$RUNNER_TEMP/GestaltX-DocumentTests"
+          "$RUNNER_TEMP/GestaltX-DocumentTests"
+
+      - name: Build iPhone release without developer credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project upstream/GestaltX.xcodeproj \
+            -scheme GestaltX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/gestaltx-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build > "$RUNNER_TEMP/gestaltx-build.log" 2>&1 || {
+              tail -n 120 "$RUNNER_TEMP/gestaltx-build.log"
+              exit 1
+            }
+          tail -n 8 "$RUNNER_TEMP/gestaltx-build.log"
+
+      - name: Add App Group declaration and verify package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gestaltx-package/Payload" output
+          ditto "$RUNNER_TEMP/gestaltx-derived/Build/Products/Release-iphoneos/GestaltX.app" \
+            "$RUNNER_TEMP/gestaltx-package/Payload/GestaltX.app"
+          app="$RUNNER_TEMP/gestaltx-package/Payload/GestaltX.app"
+          codesign --force --sign - \
+            --entitlements upstream/GestaltX/GestaltX.entitlements \
+            --generate-entitlement-der "$app"
+          codesign --verify --strict --verbose=2 "$app"
+          codesign -d --entitlements - "$app" > "$RUNNER_TEMP/gestaltx-entitlements.plist"
+          python3 - <<'PY'
+          import os, pathlib, plistlib, subprocess
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          app = root / "gestaltx-package/Payload/GestaltX.app"
+          info = plistlib.loads((app / "Info.plist").read_bytes())
+          entitlements = plistlib.loads((root / "gestaltx-entitlements.plist").read_bytes())
+          assert info["CFBundleIdentifier"] == "com.huami.gestultx"
+          assert "group.com.huami.gestultx" in entitlements["com.apple.security.application-groups"]
+          assert not (app / "embedded.mobileprovision").exists()
+          architecture = subprocess.check_output(["lipo", "-archs", str(app / info["CFBundleExecutable"])], text=True)
+          assert "arm64" in architecture.split()
+          print("Verified bundle identifier, arm64 executable and App Group declaration.")
+          PY
+          cd "$RUNNER_TEMP/gestaltx-package"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/output/$IPA_NAME" Payload
+          cd "$GITHUB_WORKSPACE"
+          python3 - <<'PY'
+          import os, pathlib, zipfile, hashlib, subprocess
+          out = pathlib.Path("output")
+          ipa = out / os.environ["IPA_NAME"]
+          with zipfile.ZipFile(ipa) as archive:
+              assert archive.testzip() is None
+              assert "Payload/GestaltX.app/GestaltX" in archive.namelist()
+          digest = hashlib.sha256(ipa.read_bytes()).hexdigest()
+          (out / "SHA256SUMS.txt").write_text(digest + "  " + ipa.name + "\n")
+          xcode = subprocess.check_output(["xcodebuild", "-version"], text=True).strip()
+          provenance = (
+              "Upstream: https://github.com/huamidev/GestaltX\n"
+              "Commit: " + os.environ["UPSTREAM_COMMIT"] + "\n"
+              "Source: https://github.com/huamidev/GestaltX/tree/" + os.environ["UPSTREAM_COMMIT"] + "\n"
+              "Source code is unmodified. App Group declaration added via ad-hoc signing.\n"
+              "This is an unofficial source build, not an upstream release.\n"
+              "Install by re-signing with AltStore; no Apple developer credentials were used in this build.\n"
+              + xcode + "\nSHA256: " + digest + "\n"
+          )
+          (out / "SOURCE.txt").write_text(provenance)
+          print(provenance)
+          PY
+          cp upstream/LICENSE output/LICENSE.txt
+          git -C upstream diff --exit-code
+          {
+            echo '### GestaltX source build complete'
+            echo 'Pinned source: 4b3b25fd1dae16154858b834c6dc7bca666016e2'
+            echo 'Existing document/cache tests passed. App Group declaration verified.'
+            echo 'Download the artifact and re-sign the IPA using AltStore.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: GestaltX-source-4b3b25f-AppGroup
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
